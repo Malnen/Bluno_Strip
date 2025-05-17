@@ -1,9 +1,8 @@
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEServer.h>
-#include <BLE2902.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ESPmDNS.h>
 #include <FastLED.h>
-#include "esp_gap_ble_api.h"
+#include "esp_wifi.h"
 
 #define LED_PIN     5
 #define NUM_LEDS    72
@@ -11,129 +10,99 @@
 #define LED_TYPE    WS2812B
 #define COLOR_ORDER GRB
 
-#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID_RX "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define CHARACTERISTIC_UUID_TX "beb5483f-36e1-4688-b7f5-ea07361b26a8"
+const char* WIFI_SSID     = "";
+const char* WIFI_PASSWORD = "";
+const unsigned int UDP_PORT = 4210;
 
+const char* DEVICE_ID = "b4e91b7e";
+
+WiFiUDP udp;
 CRGB leds[NUM_LEDS];
-BLECharacteristic* pTxCharacteristic;
-bool deviceConnected = false;
-esp_bd_addr_t lastPeerAddress;
 
 unsigned long lastActivityTime = 0;
 int pulseValue = 0;
 int pulseDirection = 1;
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
-class MyServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
-    deviceConnected = true;
+void setup() {
+  Serial.begin(115200);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi...");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(100);
+  }
+  Serial.println("Connected!");
+  Serial.printf("ESP32 IP: %s\n", WiFi.localIP().toString().c_str());
+
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
+  if (MDNS.begin(DEVICE_ID)) {
+    MDNS.addService("rgbapp", "udp", UDP_PORT);
+    MDNS.addServiceTxt("rgbapp", "udp", "name", "Bluno Strip");
+    MDNS.addServiceTxt("rgbapp", "udp", "id", DEVICE_ID);
+    Serial.printf("mDNS started: %s.local\n", DEVICE_ID);
+  } else {
+    Serial.println("mDNS setup failed");
   }
 
-  void onDisconnect(BLEServer* pServer) {
-    deviceConnected = false;
-    delay(500);
-    BLEDevice::startAdvertising();
-  }
-};
+  udp.begin(UDP_PORT);
+  Serial.printf("UDP server listening on port %u\n", UDP_PORT);
 
-void gapCallback(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t* param) {
-  if (event == ESP_GAP_BLE_UPDATE_CONN_PARAMS_EVT) {
-    memcpy(lastPeerAddress, param->update_conn_params.bda, sizeof(esp_bd_addr_t));
+  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
+  FastLED.setBrightness(BRIGHTNESS);
+  FastLED.clear();
+  FastLED.show();
 
-    esp_ble_conn_update_params_t conn_params = {
-      .bda = {0},
-      .min_int = 0x18,
-      .max_int = 0x28,
-      .latency = 0,
-      .timeout = 400
-    };
-    memcpy(conn_params.bda, lastPeerAddress, sizeof(esp_bd_addr_t));
-    esp_ble_gap_update_conn_params(&conn_params);
-
-    esp_ble_gap_set_preferred_phy(
-      lastPeerAddress,
-      ESP_BLE_GAP_PHY_1M,
-      ESP_BLE_GAP_PHY_2M,
-      ESP_BLE_GAP_PHY_2M,
-      ESP_BLE_GAP_PHY_OPTIONS_NO_PREF
-    );
-  }
+  lastActivityTime = millis();
 }
 
-class MyCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pCharacteristic) {
+void loop() {
+  int packetSize = udp.parsePacket();
+  if (packetSize > 0) {
+    IPAddress srcIP = udp.remoteIP();
+    unsigned int srcPort = udp.remotePort();
+
+    uint8_t buffer[NUM_LEDS * 3];
+    int len = udp.read(buffer, sizeof(buffer));
+    if (len <= 0) return;
+
     portENTER_CRITICAL(&mux);
     lastActivityTime = millis();
     portEXIT_CRITICAL(&mux);
-    const uint8_t* data = pCharacteristic->getData();
-    size_t len = pCharacteristic->getLength();
+
+    Serial.printf("📥 Received %d bytes from %s:%u\n", len, srcIP.toString().c_str(), srcPort);
+
     int ledCount = len / 3;
-    if (ledCount == 0) return;
+    if (ledCount > NUM_LEDS) ledCount = NUM_LEDS;
 
     for (int i = 0; i < NUM_LEDS; i++) {
       int idx = (i * ledCount) / NUM_LEDS;
       if (idx >= ledCount) idx = ledCount - 1;
-      leds[i] = CRGB(data[idx * 3], data[idx * 3 + 1], data[idx * 3 + 2]);
+      leds[i] = CRGB(buffer[idx * 3], buffer[idx * 3 + 1], buffer[idx * 3 + 2]);
     }
 
     FastLED.show();
 
     uint8_t doneByte[1] = { 0x01 };
-    pTxCharacteristic->setValue(doneByte, 1);
-    pTxCharacteristic->notify();
+    udp.beginPacket(srcIP, srcPort);
+    udp.write(doneByte, 1);
+    udp.endPacket();
+
+    Serial.println("✅ Frame applied, sent DONE (0x01)");
   }
-};
 
-void setup() {
-  Serial.begin(115200);
-  FastLED.addLeds<LED_TYPE, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS);
-  FastLED.setBrightness(BRIGHTNESS);
-  FastLED.clear(); FastLED.show();
-
-  BLEDevice::init("Bluno strip");
-  BLEDevice::setMTU(247);
-  esp_ble_gap_register_callback(gapCallback);
-
-  BLEServer* pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());
-
-  BLEService* pService = pServer->createService(SERVICE_UUID);
-
-  BLECharacteristic* pRxCharacteristic = pService->createCharacteristic(
-    CHARACTERISTIC_UUID_RX,
-    BLECharacteristic::PROPERTY_WRITE_NR
-  );
-  pRxCharacteristic->setCallbacks(new MyCallbacks());
-
-  pTxCharacteristic = pService->createCharacteristic(
-    CHARACTERISTIC_UUID_TX,
-    BLECharacteristic::PROPERTY_NOTIFY
-  );
-  pTxCharacteristic->addDescriptor(new BLE2902());
-
-  pService->start();
-
-  BLEAdvertising* pAdvertising = BLEDevice::getAdvertising();
-  pAdvertising->addServiceUUID(SERVICE_UUID);
-  pAdvertising->setScanResponse(true);
-  pAdvertising->setMinPreferred(0x06);
-  pAdvertising->setMinPreferred(0x12);
-  BLEDevice::startAdvertising();
-}
-
-void loop() {
   unsigned long diff;
   portENTER_CRITICAL(&mux);
   diff = millis() - lastActivityTime;
   portEXIT_CRITICAL(&mux);
+
   if (diff >= 10000) {
-    if (diff <= 70000 ) {
+    if (diff <= 70000) {
       slowPulse();
     } else {
       disabled();
     }
-    
     delay(25);
   }
 }
